@@ -1,0 +1,61 @@
+#!/usr/bin/env bash
+# screencapture shim: minimal macOS `screencapture` compatible capture.
+#
+# Supports: screencapture [-x] [-m] [-t fmt] <output-file>
+# Only the output-file form used by computer-use agents is implemented;
+# anything else exits nonzero with a usage hint.
+#
+# Linux backends, first available wins:
+#   1. grim (+ slurp for region selection when available)
+#   2. gnome-screenshot
+#   3. scrot
+#   4. ImageMagick import
+set -u
+
+FORMAT="png"
+OUT=""
+EXPECT_FMT=0
+for a in "$@"; do
+  if [ "$EXPECT_FMT" -eq 1 ]; then FORMAT="$a"; EXPECT_FMT=0; continue; fi
+  case "$a" in
+    -x) ;;                       # silent capture: default on Linux, ignored
+    -m) ;;                       # main monitor only: best effort, ignored
+    -t) EXPECT_FMT=1 ;;
+    -t*) FORMAT="${a#-t}" ;;
+    -*) ;;                       # other macOS flags: best effort, ignored
+    *) OUT="$a" ;;               # last positional wins, like screencapture
+  esac
+done
+
+if [ -z "$OUT" ]; then
+  echo "screencapture shim: no output file given" >&2
+  echo "usage: screencapture [-x] [-m] [-t fmt] <output-file>" >&2
+  exit 2
+fi
+
+have() { command -v "$1" >/dev/null 2>&1; }
+
+case "$FORMAT" in
+  png|jpg|jpeg) ;;
+  *)
+    echo "screencapture shim: unsupported format '$FORMAT' (png/jpg only)" >&2
+    exit 2 ;;
+esac
+
+mkdir -p "$(dirname "$OUT")" 2>/dev/null || true
+
+if have grim; then
+  if [ -n "${WAYLAND_DISPLAY:-}" ] && have slurp; then
+    exec grim -g "$(slurp)" "$OUT"
+  fi
+  exec grim "$OUT"
+elif have gnome-screenshot; then
+  exec gnome-screenshot -f "$OUT"
+elif have scrot; then
+  exec scrot --overwrite "$OUT"
+elif have import; then
+  exec import "window:root" "$OUT"
+fi
+
+echo "screencapture shim: no backend found (need grim, gnome-screenshot, scrot, or ImageMagick)" >&2
+exit 1

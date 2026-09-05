@@ -1,0 +1,121 @@
+name: build
+
+"on":
+  schedule:
+    - cron: "0 0,6,12,18 * * *"  # 4x daily: check upstream for new Codex builds
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Upstream version (tag, plain version, or 'latest')"
+        default: "latest"
+        required: false
+      arch:
+        description: "Architecture"
+        default: "x64"
+        required: false
+        type: choice
+        options: [x64, arm64]
+      src:
+        description: "Upstream source bundle"
+        default: "zip"
+        required: false
+        type: choice
+        options: [zip, dmg]
+  push:
+    paths:
+      - "scripts/**"
+      - "resources/**"
+      - ".github/workflows/build.yml"
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    outputs:
+      upstream_tag: ${{ steps.ver.outputs.upstream_tag }}
+      build_needed: ${{ steps.ver.outputs.build_needed }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Resolve upstream tag
+        id: ver
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ] && [ "${{ inputs.version }}" != "latest" ]; then
+            UPSTREAM_TAG="${{ inputs.version }}"
+          else
+            UPSTREAM_TAG="$(python3 scripts/fetch-upstream.py --tag-only)"
+          fi
+          echo "upstream_tag=$UPSTREAM_TAG" >> "$GITHUB_OUTPUT"
+          echo "Upstream tag: $UPSTREAM_TAG"
+          # Avoid rebuild loops: skip if a release for this tag already exists.
+          if gh release view "$UPSTREAM_TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            echo "build_needed=false" >> "$GITHUB_OUTPUT"
+            echo "Release $UPSTREAM_TAG already exists; nothing to do."
+          else
+            echo "build_needed=true" >> "$GITHUB_OUTPUT"
+            echo "No release for $UPSTREAM_TAG yet; build needed."
+          fi
+
+  build:
+    needs: check
+    if: needs.check.outputs.build_needed == 'true'
+    # Scheduled/push builds target x64; workflow_dispatch may select arm64.
+    runs-on: ${{ github.event_name == 'workflow_dispatch' && inputs.arch == 'arm64' && 'ubuntu-24.04-arm' || 'ubuntu-latest' }}
+    permissions:
+      contents: read
+    env:
+      BUILD_ARCH: ${{ inputs.arch || 'x64' }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+      - name: Install host tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y p7zip-full desktop-file-utils zsync \
+            python3 make g++ libfuse2 file
+      - name: Build AppImage
+        run: |
+          bash scripts/build-appimage.sh "${{ inputs.version || 'latest' }}" \
+            "$BUILD_ARCH" --src "${{ inputs.src || 'zip' }}"
+      - name: Sanity checks
+        run: |
+          test -f "dist/version.txt"
+          test -f "dist/latest.json"
+          test -f "dist/SHA256SUMS"
+          APPIMAGE="$(python3 -c 'import json; print("dist/" + json.load(open("dist/latest.json"))["appimage"])')"
+          test -f "$APPIMAGE"
+          file "$APPIMAGE" | grep -qi 'ELF' || (echo "not an ELF AppImage" >&2; exit 1)
+          (cd dist && sha256sum -c SHA256SUMS)
+          desktop-file-validate resources/Codex.desktop || \
+            echo "desktop-file-validate failed (non-fatal)"
+          bash scripts/computer-use-check.sh || true
+      - uses: actions/upload-artifact@v4
+        with:
+          name: codex-appimage-${{ env.BUILD_ARCH }}
+          path: dist/
+
+  release:
+    needs: [check, build]
+    if: needs.check.outputs.build_needed == 'true'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: codex-appimage-*
+          merge-multiple: true
+          path: dist/
+      - name: Create GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          TAG="${{ needs.check.outputs.upstream_tag }}"
+          gh release create "$TAG" --repo "$GITHUB_REPOSITORY" \
+            --title "Codex $TAG (Linux AppImage)" \
+            --notes "Community Linux port of the official macOS Codex $TAG desktop build, converted to AppImage. See dist/latest.json for provenance." \
+            dist/*.AppImage dist/latest.json dist/SHA256SUMS dist/version.txt

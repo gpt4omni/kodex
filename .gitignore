@@ -1,0 +1,11 @@
+# Build outputs
+dist/
+work/
+*.AppImage
+!resources/**
+
+# Temp / editor noise
+*.tmp
+*.log
+.DS_Store
+*~

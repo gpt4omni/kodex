@@ -1,0 +1,10 @@
+[Desktop Entry]
+Type=Application
+Name=Codex
+Comment=OpenAI Codex desktop app (community Linux AppImage port)
+Exec=AppRun %U
+Icon=codex
+Categories=Development;Utility;
+Terminal=false
+StartupWMClass=Codex
+X-AppImage-Version=latest
