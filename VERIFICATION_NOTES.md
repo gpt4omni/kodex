@@ -110,3 +110,46 @@ Deliberately NOT verified (unchanged from above, plus):
 - Nothing committed: the workspace has no git repo (`git status`
   reports "not a git repository"), so there was nothing to commit or
   push with.
+
+## Launch-debug session (2026-09-05, same host, X11)
+
+The first CI-built release launched but showed failures in sequence; each
+was root-caused against the extracted bundle and fixed in the repo, then
+re-verified by launch-testing locally built test AppImages:
+
+- `Codex requires the Owl app shell` (bootstrap threw on stock Electron):
+  upstream gates on its Owl fork via `app.showTaskManager`. Fixed in
+  `scripts/owl-compat-patch.py` (conditional stubs; fail-loud on shape
+  change). Verified: gate error gone, window created.
+- `cannot access its local database`: CI's in-tree `@electron/rebuild`
+  failed (app tree uses `workspace:*` links npm cannot resolve; node-gyp
+  configure failed) and deleted `better_sqlite3.node`. Fixed:
+  `scripts/build-appimage.sh` rebuilds better-sqlite3/node-pty in a clean
+  staging dir, asserts ELF + presence (fatal otherwise), packs asar with
+  `--unpack '*.node'`. Verified in shipped asar: both `.node` files ELF.
+- `setDebugChromePagesEnabled / isInputShapeSupported /
+  isSystemBackdropSupported / isHidden is not a function`: Owl-only APIs
+  confirmed absent from stock Electron 40.8.5 by runtime introspection
+  (descriptor walk; direct typeof-walk SIGTRAPs on a native getter).
+  Stubbed conditionally in the patch script; `setPreferredLanguages`
+  guarded at its single call site. Verified: startup proceeds past all.
+- `Unable to locate the Codex CLI binary`: resolver joins the name onto
+  `process.resourcesPath` directly (`resources/codex`, not `bin/codex`
+  despite the error text). Build now bundles the Linux CLI from npm
+  `@openai/codex` there. Verified: app-server transport reaches
+  `connected` over stdio.
+- Black window: two causes. (1) AppRun passed the asar path explicitly,
+  forcing `isPackaged=false`, for which the bundle loads a localhost dev
+  server. Fixed: no asar arg + `ELECTRON_FORCE_IS_PACKAGED=1`.
+  (2) macOS-vibrancy transparency (startup background, opaqueWindows
+  default, GPU compositing flags). Fixed via renderer patches in
+  `owl-compat-patch.py` and AppRun defaults (`--ozone-platform-hint=auto
+  --disable-gpu-sandbox --disable-gpu-compositing`).
+- Final release `v26.901.41600-b7982` (rebuilt by CI after fixes)
+  smoke-tested locally: `packaged=true`, 0 localhost refs, no bootstrap
+  errors, `startup window revealed`, `local app-server sqlite
+  initialized`. Only remaining log item: non-fatal
+  `browserSession.getDownloadHistory is not a function` (caught; native
+  download history unavailable).
+- Not verified: real login + chat session, Wayland, non-NixOS distros,
+  arm64 build, DMG (`--src dmg`) path.
