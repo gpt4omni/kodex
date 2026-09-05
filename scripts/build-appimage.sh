@@ -332,6 +332,30 @@ chmod +x "$APPDIR/AppRun"
 cp "$REPO_ROOT/resources/Codex.desktop" "$APPDIR/Codex.desktop"
 # Stamp the real tag so the desktop file never ships the 'latest' placeholder.
 sed -i "s/^X-AppImage-Version=.*/X-AppImage-Version=$TAG/" "$APPDIR/Codex.desktop"
+# --- 8b. Bundle the Linux Codex CLI ----------------------------------------------
+# Main startup spawns the app-server through a CLI binary resolved from
+# CODEX_CLI_PATH or <resources>/codex (verified against the resolver in
+# the bundle: it joins the executable name directly onto the resources
+# path and checks it is a file — resources/bin/codex is NOT consulted,
+# despite what the app's own error message says). Fetch the Linux binary
+# from npm (@openai/codex resolves to the right @openai/codex-linux-*
+# platform package). Without this the app quits with "Unable to locate
+# the Codex CLI binary."
+if [ "$ARCH" = "arm64" ]; then CLI_TRIPLE="aarch64-unknown-linux-musl"; else CLI_TRIPLE="x86_64-unknown-linux-musl"; fi
+CLI_STAGE="$WORK/cli-stage"
+mkdir -p "$CLI_STAGE"
+(
+  cd "$CLI_STAGE" \
+    && npm init -y >/dev/null 2>&1 \
+    && npm install --no-audit --no-fund @openai/codex
+) || fail "Codex CLI npm install failed"
+CLI_BIN="$(find "$CLI_STAGE/node_modules/@openai" -path "*vendor/$CLI_TRIPLE/bin/codex" -type f | head -n 1)"
+[ -n "$CLI_BIN" ] || fail "Linux Codex CLI binary not found after npm install"
+CLI_VER="$("$CLI_BIN" --version 2>/dev/null | head -n 1 || echo unknown)"
+cp "$CLI_BIN" "$APPDIR_LIB/resources/codex"
+chmod +x "$APPDIR_LIB/resources/codex"
+log "bundled Codex CLI: $CLI_VER"
+echo "OK: bundled Linux Codex CLI ($CLI_VER) at resources/codex" >> "$REPORT"
 cp "$REPORT" "$APPDIR_LIB/native-modules-report.txt"
 
 # Icon: prefer a shipped PNG, else carve an embedded PNG out of electron.icns,

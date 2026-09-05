@@ -44,7 +44,7 @@ A `screencapture` shim is bundled in the AppImage. It accepts the macOS
 flags agents pass (`-x`, `-m`, `-t png|jpg`) and hands off to one of the
 backends above.
 
-Two conversion notes worth knowing:
+Conversion notes worth knowing:
 
 - Upstream gates startup on OpenAI's Owl Electron fork and refuses stock
   Electron. The build stubs that check (`scripts/owl-compat-patch.py`),
@@ -52,6 +52,14 @@ Two conversion notes worth knowing:
 - `better-sqlite3` and `node-pty` are rebuilt for Linux in a clean staging
   directory during the build. Never `npm install` inside the extracted app
   tree: its `workspace:*` links break plain npm.
+- The Linux Codex CLI (from npm `@openai/codex`) is bundled at
+  `resources/codex`, exactly where the app's resolver looks. You can point
+  it elsewhere with `CODEX_CLI_PATH`.
+- The launcher runs the app packaged (`ELECTRON_FORCE_IS_PACKAGED=1`,
+  no explicit asar path). Unpackaged mode loads a localhost dev server
+  and paints a black window. Default flags are `--ozone-platform-hint=auto
+  --disable-gpu-sandbox --disable-gpu-compositing`; your own arguments are
+  appended after them.
 
 Input tools:
 
