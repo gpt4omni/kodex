@@ -6,11 +6,15 @@
 #   2. detect the bundled Electron version from the framework Info.plist
 #      (fallback pin when detection fails)
 #   3. npx asar extract app.asar
-#   4. rebuild darwin native modules for Linux with @electron/rebuild,
-#      with guaranteed better-sqlite3/node-pty handling; drop what cannot
-#      be rebuilt and report it
-#   5. download the matching Linux Electron runtime, repack app.asar,
-#      assemble AppDir, run appimagetool
+#   4. rebuild better-sqlite3/node-pty for Linux in a clean staging dir
+#      with @electron/rebuild (never inside the extracted tree: its
+#      workspace:* links break npm and a failed in-tree rebuild deletes
+#      binaries); copy the ELF binaries back, fail loudly if absent;
+#      drop remaining darwin-only .node files and report them
+#   5. stub the Owl app-shell gate (scripts/owl-compat-patch.py) so the
+#      app starts on stock Electron
+#   6. download the matching Linux Electron runtime, repack app.asar
+#      (natives unpacked alongside), assemble AppDir, run appimagetool
 #
 # Usage: scripts/build-appimage.sh [VERSION] [ARCH] [--src zip|dmg]
 #        [--electron-version X.Y.Z] [--outdir DIR] [--workdir DIR]
@@ -213,12 +217,12 @@ MACHO_BEFORE="$(scan_macho "$UNPACKED" | tee "$WORK/macho-before.txt" | wc -l)"
 log "Mach-O .node files before rebuild: $MACHO_BEFORE"
 
 # --- 5. Rebuild native modules for Linux --------------------------------------
-if [ "$MACHO_BEFORE" -gt 0 ]; then
-  log "rebuilding native modules for Electron $ELECTRON_V arch $ARCH"
-  (cd "$UNPACKED" && npx -y @electron/rebuild --version "$ELECTRON_V" --arch "$ARCH") \
-    || log "warning: @electron/rebuild exited nonzero; will verify and drop leftovers"
-fi
-
+# NOTE: never run npm/@electron/rebuild inside the extracted tree itself.
+# The app's package.json uses workspace:* links that plain npm cannot
+# resolve, and an in-tree rebuild wipes binaries it then fails to replace
+# (this shipped a v26.901.41600 AppImage with no sqlite binary at all).
+# Instead, rebuild each required module in a clean staging dir from npm
+# and copy the finished Linux binaries back over the darwin ones.
 REPORT="$WORK/native-modules-report.txt"
 {
   echo "native module report for $TAG ($ARCH, Electron $ELECTRON_V)"
@@ -226,47 +230,64 @@ REPORT="$WORK/native-modules-report.txt"
   [ -f "$WORK/macho-before.txt" ] && cat "$WORK/macho-before.txt"
 } > "$REPORT"
 
-# Guaranteed handling: better-sqlite3 and node-pty must end up as working
-# Linux binaries or be explicitly reported.
-for mod in better-sqlite3 node-pty; do
-  MOD_FILES="$(find "$UNPACKED/node_modules/$mod" -name "*.node" 2>/dev/null || true)"
-  if [ -z "$MOD_FILES" ]; then
-    echo "NOTE: $mod not shipped in app bundle; skipping" >> "$REPORT"
-    continue
-  fi
-  STILL_MACHO=0
-  while IFS= read -r f; do
-    [ -z "$f" ] && continue
-    if scan_macho "$(dirname "$f")" | grep -qx "$f"; then STILL_MACHO=1; fi
-  done <<< "$MOD_FILES"
-  if [ "$STILL_MACHO" -eq 1 ]; then
-    MOD_WANT="$(UNPACKED="$UNPACKED" MOD="$mod" python3 -c 'import json,os; print(json.load(open(os.path.join(os.environ["UNPACKED"],"package.json"))).get("dependencies",{}).get(os.environ["MOD"]) or "latest")')"
-    log "warning: $mod still Mach-O; reinstalling $mod@$MOD_WANT from npm and rebuilding"
-    (cd "$UNPACKED" && npm install --no-save --no-audit --no-fund "$mod@$MOD_WANT" \
-      && npx -y @electron/rebuild --version "$ELECTRON_V" --arch "$ARCH" --only="$mod") \
-      || echo "FAIL: $mod reinstall/rebuild failed" >> "$REPORT"
-    if scan_macho "$UNPACKED/node_modules/$mod" | grep -q .; then
-      echo "FAIL: $mod could not be rebuilt for Linux; its .node files were dropped" >> "$REPORT"
-      scan_macho "$UNPACKED/node_modules/$mod" | while IFS= read -r f; do rm -f "$f"; done
-    else
-      echo "OK: $mod rebuilt for Linux/Electron $ELECTRON_V" >> "$REPORT"
-    fi
-  else
-    echo "OK: $mod already Linux-native after rebuild" >> "$REPORT"
-  fi
-done
+STAGE="$WORK/native-stage"
+mkdir -p "$STAGE"
+# Pin exact versions: the app's semver ranges (^12.9.0 etc.) must resolve to
+# the same code the app was tested against, so resolve once and record.
+MOD_WANT_BS3="$(python3 -c 'import json; print(json.load(open("'"$UNPACKED"'/package.json")).get("dependencies",{}).get("better-sqlite3") or "latest")')"
+MOD_WANT_PTY="$(python3 -c 'import json; print(json.load(open("'"$UNPACKED"'/package.json")).get("dependencies",{}).get("node-pty") or "latest")')"
+log "staging clean rebuild: better-sqlite3@$MOD_WANT_BS3 node-pty@$MOD_WANT_PTY"
+(
+  cd "$STAGE" \
+    && npm init -y >/dev/null 2>&1 \
+    && npm install --no-audit --no-fund \
+         "electron@$ELECTRON_V" \
+         "better-sqlite3@$MOD_WANT_BS3" \
+         "node-pty@$MOD_WANT_PTY" \
+    && npx -y @electron/rebuild --version "$ELECTRON_V" --arch "$ARCH"
+) || fail "clean native-module rebuild failed (need network + python3/make/g++)"
 
-# Generic path: anything still Mach-O cannot load on Linux; drop + report.
+# Copy the Linux binaries back over the darwin ones, then assert: present
+# AND ELF. A missing sqlite binary means the app cannot open its local
+# database, so this is a fatal build error, not a warning.
+STAGED_BS3="$(find "$STAGE/node_modules/better-sqlite3" -name 'better_sqlite3.node' | head -n 1)"
+STAGED_PTY="$(find "$STAGE/node_modules/node-pty" -name 'pty.node' | head -n 1)"
+[ -n "$STAGED_BS3" ] || fail "better-sqlite3 binary missing after clean rebuild"
+[ -n "$STAGED_PTY" ] || fail "node-pty binary missing after clean rebuild"
+mkdir -p "$UNPACKED/node_modules/better-sqlite3/build/Release" \
+         "$UNPACKED/node_modules/node-pty/build/Release"
+cp "$STAGED_BS3" "$UNPACKED/node_modules/better-sqlite3/build/Release/better_sqlite3.node"
+cp "$STAGED_PTY" "$UNPACKED/node_modules/node-pty/build/Release/pty.node"
+is_elf() { [ "$(head -c 4 "$1" | od -An -tx1 | tr -d ' \n')" = "7f454c46" ]; }
+is_elf "$UNPACKED/node_modules/better-sqlite3/build/Release/better_sqlite3.node" \
+  || fail "better-sqlite3 binary is not ELF after rebuild"
+is_elf "$UNPACKED/node_modules/node-pty/build/Release/pty.node" \
+  || fail "node-pty binary is not ELF after rebuild"
+{
+  echo "OK: better-sqlite3@$MOD_WANT_BS3 rebuilt for Linux/Electron $ELECTRON_V"
+  echo "OK: node-pty@$MOD_WANT_PTY rebuilt for Linux/Electron $ELECTRON_V"
+} >> "$REPORT"
+
+# Generic path: any other Mach-O leftovers are darwin-only features
+# (objc bridge, mac permission helpers); they cannot load on Linux,
+# so drop them and report.
 LEFTOVER="$(scan_macho "$UNPACKED")"
 if [ -n "$LEFTOVER" ]; then
-  log "warning: dropping $(echo "$LEFTOVER" | wc -l) unrebuildable Mach-O .node file(s)"
-  echo "DROPPED (still Mach-O after rebuild, deleted):" >> "$REPORT"
+  log "warning: dropping $(echo "$LEFTOVER" | wc -l) darwin-only Mach-O .node file(s)"
+  echo "DROPPED (darwin-only, deleted):" >> "$REPORT"
   echo "$LEFTOVER" >> "$REPORT"
   echo "$LEFTOVER" | while IFS= read -r f; do rm -f "$f"; done
 else
   echo "OK: no Mach-O .node files remain" >> "$REPORT"
 fi
 log "native module report:"; sed 's/^/  /' "$REPORT"
+
+# --- 5b. Owl app-shell compat ---------------------------------------------------
+# Upstream gates startup on OpenAI's Owl Electron fork
+# (app.showTaskManager check) and quits on stock Electron. Stub the gate;
+# the patch script fails loudly if upstream changes shape.
+python3 "$SCRIPT_DIR/owl-compat-patch.py" "$UNPACKED" \
+  || fail "Owl compat patch failed; refusing to ship an AppImage that cannot start"
 
 # --- 6. Linux Electron runtime -------------------------------------------------
 if [ "$ARCH" = "arm64" ]; then EARCH="arm64"; else EARCH="x64"; fi
@@ -287,8 +308,11 @@ fi
 [ -x "$ELECTRON_DIR/electron" ] || fail "Linux Electron binary missing after unzip"
 
 # --- 7. Repack app.asar --------------------------------------------------------
+# --unpack keeps native modules as real files in app.asar.unpacked/ so the
+# loader never depends on temp extraction; Electron picks the adjacent
+# unpacked dir up automatically.
 log "repacking app.asar"
-npx -y asar pack "$UNPACKED" "$WORK/app.asar" || fail "asar pack failed"
+npx -y asar pack "$UNPACKED" "$WORK/app.asar" --unpack '*.node' || fail "asar pack failed"
 
 # --- 8. Assemble AppDir ---------------------------------------------------------
 APPDIR="$WORK/AppDir"
@@ -297,6 +321,10 @@ mkdir -p "$APPDIR_LIB" "$APPDIR/usr/bin"
 cp -a "$ELECTRON_DIR"/. "$APPDIR_LIB"/
 rm -f "$APPDIR_LIB/resources/default_app.asar"
 cp "$WORK/app.asar" "$APPDIR_LIB/resources/app.asar"
+if [ -d "$WORK/app.asar.unpacked" ]; then
+  rm -rf "$APPDIR_LIB/resources/app.asar.unpacked"
+  cp -a "$WORK/app.asar.unpacked" "$APPDIR_LIB/resources/app.asar.unpacked"
+fi
 cp "$REPO_ROOT/resources/bin/screencapture" "$APPDIR/usr/bin/screencapture"
 chmod +x "$APPDIR/usr/bin/screencapture"
 cp "$REPO_ROOT/resources/AppRun.sh" "$APPDIR/AppRun"

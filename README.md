@@ -44,6 +44,15 @@ A `screencapture` shim is bundled in the AppImage. It accepts the macOS
 flags agents pass (`-x`, `-m`, `-t png|jpg`) and hands off to one of the
 backends above.
 
+Two conversion notes worth knowing:
+
+- Upstream gates startup on OpenAI's Owl Electron fork and refuses stock
+  Electron. The build stubs that check (`scripts/owl-compat-patch.py`),
+  which also means Help > Task Manager is a harmless no-op.
+- `better-sqlite3` and `node-pty` are rebuilt for Linux in a clean staging
+  directory during the build. Never `npm install` inside the extracted app
+  tree: its `workspace:*` links break plain npm.
+
 Input tools:
 
 | Tool | Session | Notes |
